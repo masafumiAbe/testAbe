@@ -1,47 +1,130 @@
 
-import re
 import csv
+import re
 import sys
-from urllib.request import urlopen
+from html.parser import HTMLParser
+from typing import List, Tuple
+from urllib.request import Request, build_opener
 
-URL = "https://ja.wikipedia.org/w/index.php?printable=yes&title=%E5%85%A8%E5%9B%BD%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E5%9B%B3%E9%91%91%E9%A0%86%E3%81%AE%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E4%B8%80%E8%A6%A7"
+URL = "https://pokemon-irasuto-taizen.com/pokemon-list/"
 
-def fetch_text(url=URL):
-    with urlopen(url) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
 
-def parse_pairs(text: str):
-    # Lines look like: "0001 【84†フシギダネ】"
-    # We'll capture the 4-digit number and the name between the last '†' and '】'
-    pairs = {}
-    for line in text.splitlines():
-        m = re.search(r"(\\d{4})\\s+.*?\\u2020?([^\\]]*?)\\u3011", line)  # cautious fallback
-        # Better pattern for Wikipedia printable:
-        m = re.search(r"(\\d{4})\\s+.*?\\u2020?([^】]*?)】", line) or m
-        if not m:
-            # Specific pattern: 0001 【84†フシギダネ】
-            m = re.search(r"(\\d{4})\\s+【[^†】]*?†([^】]+)】", line)
-        if m:
-            num = int(m.group(1))
-            name = m.group(2).strip()
-            if 1 <= num <= 1023:
-                pairs[num] = name
-    # Ensure continuous coverage
-    missing = [i for i in range(1, 1024) if i not in pairs]
-    if missing:
-        raise SystemExit(f"Missing entries: {missing[:10]}... total={len(missing)}")
-    return [(i, pairs[i]) for i in range(1, 1024)]
+def fetch_html(url: str = URL) -> str:
+    """Fetch HTML from the illustration encyclopedia website.
 
-def main(out_path="pokedex_001_1023.csv"):
-    text = fetch_text()
-    pairs = parse_pairs(text)
+    A desktop browser user-agent and referer are attached because the site blocks
+    plain Python user agents with HTTP 403.
+    """
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://pokemon-irasuto-taizen.com/",
+        "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    req = Request(url, headers=headers)
+    opener = build_opener()
+    with opener.open(req, timeout=30) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="ignore")
+
+
+class _TableCollector(HTMLParser):
+    """Collect all table rows as plain-text matrices."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._tables: List[List[List[str]]] = []
+        self._in_table = False
+        self._current_table: List[List[str]] = []
+        self._current_row: List[str] = []
+        self._in_cell = False
+        self._cell_parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        if tag == "table":
+            self._in_table = True
+            self._current_table = []
+        elif self._in_table and tag == "tr":
+            self._current_row = []
+        elif self._in_table and tag in {"td", "th"}:
+            self._in_cell = True
+            self._cell_parts = []
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if tag == "table" and self._in_table:
+            if self._current_table:
+                self._tables.append(self._current_table)
+            self._in_table = False
+            self._current_table = []
+        elif self._in_table and tag == "tr":
+            if self._current_row:
+                self._current_table.append(self._current_row)
+            self._current_row = []
+        elif self._in_table and tag in {"td", "th"} and self._in_cell:
+            text = re.sub(r"\s+", " ", "".join(self._cell_parts)).strip()
+            self._current_row.append(text)
+            self._in_cell = False
+            self._cell_parts = []
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._in_cell:
+            self._cell_parts.append(data)
+
+    @property
+    def tables(self) -> List[List[List[str]]]:
+        return self._tables
+
+
+def parse_pokemon_table(html: str) -> List[Tuple[int, str]]:
+    """Extract (dex, japanese_name) pairs from the target table."""
+
+    parser = _TableCollector()
+    parser.feed(html)
+
+    for table in parser.tables:
+        if not table:
+            continue
+        header = table[0]
+        if len(header) < 2:
+            continue
+        if "図鑑" not in header[0] or "ポケモン" not in header[1]:
+            continue
+
+        results: List[Tuple[int, str]] = []
+        for row in table[1:]:
+            if len(row) < 2:
+                continue
+            num_match = re.search(r"\d+", row[0])
+            if not num_match:
+                continue
+            dex = int(num_match.group())
+            name = row[1].strip()
+            if not name:
+                continue
+            results.append((dex, name))
+
+        if results:
+            results.sort(key=lambda x: x[0])
+            return results
+
+    raise SystemExit("Could not locate the ポケモン一覧 table with 図鑑No and ポケモン名 columns.")
+
+
+def main(out_path: str = "pokemon_irasuto_taizen.csv") -> None:
+    html = fetch_html()
+    pairs = parse_pokemon_table(html)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["id", "name"])
-        for i, name in pairs:
-            w.writerow([i, name])
+        writer = csv.writer(f)
+        writer.writerow(["図鑑No", "ポケモン名"])
+        writer.writerows(pairs)
     print(f"Wrote {len(pairs)} entries to {out_path}")
 
+
 if __name__ == "__main__":
-    out = sys.argv[1] if len(sys.argv) > 1 else "pokedex_001_1023.csv"
+    out = sys.argv[1] if len(sys.argv) > 1 else "pokemon_irasuto_taizen.csv"
     main(out)
